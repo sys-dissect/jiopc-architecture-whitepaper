@@ -57,10 +57,13 @@ This whitepaper provides an objective, structured engineering dissection of the 
     +---------------------------------------------------------------------+
 ```
 
-### 1. Compute Subsystem
+### 1. Compute Subsystem & Ephemeral Node Recycling
 * **Processor Architecture**: Intel Xeon Platinum 8370C CPU @ 2.80 GHz (Family 6, Model 106, Stepping 6).
 * **Process Technology**: Intel 10nm Ice Lake-SP Server Architecture.
 * **Virtual Core Topology**: 8 vCPUs configured as 1 single physical socket with 8 dedicated cores (1 execution thread per core, no SMT oversubscription observed in baseline benchmarks).
+* **Decoupled Compute Fabric & Node Recycling**: Compute instances are **ephemeral, disposable worker nodes** allocated dynamically from a shared cloud pool. Hostnames cycle across sessions (e.g., `JPC8VCF-0159` → `JPC8VCF-0229` → `JPC8VCF-0184` → `JPC8VCF-0001`). 
+  * **Architectural Implication**: Any filesystem changes made outside of `$HOME` (e.g., in `/tmp`, `/var`, or `/usr`) are **permanently destroyed upon pool recycling**.
+  * **Persistence Anchor**: Only `$HOME` (mounted via NFSv4.1) is stateful across sessions. All custom binaries, environment files, user systemd units, and Tailscale states must reside under `$HOME` to survive node recreation.
 * **Hardware Accelerators**:
   * **AVX-512 Vector Extensions**: Complete support for `AVX-512F` (Foundation), `AVX-512CD` (Conflict Detection), `AVX-512BW` (Byte/Word), `AVX-512DQ` (Doubleword/Quadword), and `AVX-512VL` (Vector Length orthogonal extensions).
   * **VNNI (Vector Neural Network Instructions)**: Dedicated hardware instructions for INT8 and INT4 convolution and dot-product calculations (`VPDPBUSD`), providing massive throughput acceleration for quantized neural networks.
@@ -71,7 +74,11 @@ This whitepaper provides an objective, structured engineering dissection of the 
 * **Kernel Paging Configuration**: Transparent Huge Pages (THP) are statically enabled (`[always] madvise never`). This reduces Translation Lookaside Buffer (TLB) misses during large matrix transformations typical in neural inference and video transcoding.
 * **Swap Configuration**: **0 MB**. No swapfile or swap partition is configured on the instance. Memory management is unforgiving: allocations exceeding 16.0 GB immediately trigger the Linux kernel Out-Of-Memory (OOM) killer.
 
-### 3. Tri-Tier Storage Architecture
+### 3. Enterprise Identity & Dynamic Directory Mapping
+* **The GID Anomaly**: Running standard Linux identity tools often yields warnings such as `groups: cannot find name for group ID 3387120`.
+* **The Architectural Cause**: User identities (`UID 3387120`, `GID 3387120`) are not statically defined in local `/etc/passwd` or `/etc/group` files. Instead, they are dynamically mapped at session initialization via enterprise directory services (Accops HyWorks / Active Directory PAM modules). The local NSS group database is left unpopulated, which can cause utilities expecting local group names to emit non-fatal resolution warnings.
+
+### 4. Tri-Tier Storage Architecture
 
 The instance exposes three independent storage tiers:
 
@@ -91,10 +98,11 @@ storage-cons-prod-dp.jiopc.local:/fs_cons_prod_119/001217236281/001217236281_0  
 * **User Reality**: The user's actual files consume only **7.3 GB**. The ~395 GB "used" metric represents the collective footprint of all tenants provisioned on cluster volume 119.
 * **Quota Reality**: The user's account plan includes **1 TB**. This quota is enforced server-side. Exceeding 1 TB triggers `EDQUOT` (Disk quota exceeded), despite `df` reporting 99 TB available.
 
-### 4. Network Perimeter & Security Topology
+### 5. Network Perimeter & Security Topology
 * **Network Adapter**: Virtual Ethernet adapter (`eth0`) with local IPv4 address `10.1.10.98/24` on an isolated Azure Virtual Network (vNet).
+* **Internal DNS Infrastructure**: System name resolution queries dedicated internal datacenter DNS resolvers at `10.163.66.132` and `10.163.66.134`.
 * **Firewall Restrictions**: Direct outbound TCP traffic to external IPv4 addresses on standard ports (80, 443, 22) is dropped at the cloud security group boundary.
-* **Proxy Architecture**: All outbound internet connectivity is routed through a local HTTP broker (`px-proxy` on `127.0.0.1:3128`), which delegates authentication to an enterprise PAC cluster (`proxy-ngpr.jiopc.local:8080/proxy.pac`).
+* **Proxy Architecture**: All outbound internet connectivity is mediated through a local forward proxy broker (`px-proxy` / Squid on `127.0.0.1:3128`), which resolves authentication against an enterprise PAC cluster (`proxy-ngpr.jiopc.local:8080/proxy.pac`).
 * **Kernel Privilege Restrictions**:
   * Unprivileged user UID `3387120`, GID `3387120`.
   * Sudo access: Strictly denied (`user is not in sudoers file`).
@@ -154,6 +162,24 @@ Because `/home/001217236281_0` resides on a centralized corporate NFS array (`st
 ### 4. Missing Kernel Swap
 The system operates with **zero swap space**. In an 8-core machine running heavy multi-threaded workloads, memory fragmentation and sudden allocation spikes (e.g. loading large PyTorch models or uncompressed video frames) will immediately trigger the kernel OOM killer, killing processes without swap buffering.
 
+### 5. DNS Resolution Sensitivity & The MagicDNS Deadlock
+* **The Vulnerability**: Overlay networks like Tailscale default to injecting their own coordination nameserver (MagicDNS on `100.100.100.100`) into `/etc/resolv.conf`.
+* **The Deadlock**: The instance's local forward proxy (`127.0.0.1:3128`) requires internal datacenter DNS resolvers (`10.163.66.132`, `10.163.66.134`) to resolve internal cluster endpoints (`proxy-ngpr.jiopc.local`).
+* **The Consequence & Remediation**: If MagicDNS overwrites `/etc/resolv.conf`, the local proxy can no longer resolve the upstream PAC broker, causing total loss of external internet access. Tailscale must be explicitly configured with **`--accept-dns=false`** to protect the host's internal DNS routing.
+
+### 6. WebRTC Desktop Streaming Overhead & Keystroke Interception
+* **Browser Rendering Lag**: The consumer WebRTC / video-stream interface introduces perceptible frame pacing jitter, mouse latency, and visual compression banding during active text editing or coding.
+* **Keystroke Hijacking**: Essential developer keyboard shortcuts are intercepted by the client host browser rather than reaching the guest VM:
+  * `Ctrl + W` closes the active browser tab rather than closing an editor pane.
+  * `Ctrl + T` opens a new browser tab.
+  * `Ctrl + N` opens a new browser window.
+  * `Alt + Tab` triggers window switching on the local host machine.
+* **The Headless SSH Advantage**: Bypassing the WebRTC stream via native SSH completely eliminates keystroke collision and restores full raw terminal keybinding fidelity.
+
+### 7. Server Image Terminfo Gaps
+* **The Anomaly**: Base server images omit standard desktop terminal capabilities. Connecting with terminals that advertise `TERM=gnome-terminal` or custom emulators triggers errors like `'gnome-terminal': unknown terminal type`.
+* **The Impact**: Terminal curses utilities (`htop`, `vim`, `glow`, `tmux`) will crash or display distorted box borders unless the session explicitly defines `export TERM=xterm-256color`.
+
 ---
 
 ## Part III: Empirical Performance Benchmarks
@@ -208,11 +234,11 @@ All benchmark tests were executed on the target instance under verified isolated
 
 | Dimension | Strengths & Capabilities | Weaknesses & Architectural Bottlenecks |
 | :--- | :--- | :--- |
-| **Compute & CPU** | • Enterprise Intel Ice Lake architecture.<br/>• Full **AVX-512 and VNNI** vector instruction sets.<br/>• CPU governor locked to **`performance`** (no downclocking).<br/>• Excellent CPU-based AI inference & video transcoding. | • 8 virtual cores limited to single socket.<br/>• No dedicated GPU / NPU hardware accelerator.<br/>• No CPU core pin isolation between vCPUs. |
+| **Compute & CPU** | • Enterprise Intel Ice Lake architecture.<br/>• Full **AVX-512 and VNNI** vector instruction sets.<br/>• CPU governor locked to **`performance`** (no downclocking).<br/>• Excellent CPU-based AI inference & video transcoding. | • 8 virtual cores limited to single socket.<br/>• No dedicated GPU / NPU hardware accelerator.<br/>• **Ephemeral node recycling**: Local `/tmp` and OS root wiped between sessions.<br/>• No CPU core pin isolation between vCPUs. |
 | **Memory** | • 16 GB capacity supports 7B–9B quantized LLMs.<br/>• Transparent Huge Pages (`THP`) enabled for low TLB overhead. | • **0 MB Swap**: Instant process termination upon memory exhaustion.<br/>• Multi-threaded apps risk heap fragmentation (64 default arenas). |
 | **Storage** | • **581 MB/s continuous sustained write speed** over NFS.<br/>• Fast 4K random latency (0.01 ms on local SSD).<br/>• Generous 1 TB user plan quota.<br/>• 128 GB secondary SSD (`/mnt/sfdisk`) with 100+ pre-installed apps. | • `df -h` reporting quirk shows shared 100 TB multi-tenant pool.<br/>• Plaintext data on enterprise NFS risks compliance/audit scanning.<br/>• Writing thousands of tiny files over NFS suffers from RPC latency. |
-| **Networking** | • High-bandwidth internal datacenter pipe.<br/>• Supports userspace WireGuard mesh via Tailscale. | • **Direct outbound HTTP/HTTPS blocked** (must use `127.0.0.1:3128`).<br/>• `/dev/net/tun` absent; standard VPNs cannot initialize.<br/>• Inbound ports strictly blocked by cloud security groups. |
-| **Session & OS** | • Full systemd user session manager available.<br/>• Lingering can be enabled to persist background services. | • Default **15-minute network-idle session killswitch**.<br/>• Synthetic X11 inputs (`xdotool`) ignored by XRDP driver.<br/>• Zero administrative (`sudo`) access; cannot install `.deb` packages. |
+| **Networking** | • High-bandwidth internal datacenter pipe.<br/>• Supports userspace WireGuard mesh via Tailscale.<br/>• Headless SSH bypasses WebRTC video streaming. | • **Direct outbound HTTP/HTTPS blocked** (must use `127.0.0.1:3128`).<br/>• `/dev/net/tun` absent; standard VPNs cannot initialize.<br/>• **MagicDNS deadlock**: VPN DNS overrides break proxy PAC resolution.<br/>• Inbound ports strictly blocked by cloud security groups. |
+| **Session & OS** | • Full systemd user session manager available.<br/>• Lingering can be enabled to persist background services.<br/>• Trivially accessible host shell via Flatpak escape. | • Default **15-minute network-idle session killswitch**.<br/>• WebRTC browser client **intercepts keystrokes** (`Ctrl+W`, `Ctrl+T`).<br/>• Zero administrative (`sudo`) access; cannot install `.deb` packages.<br/>• Server image lacks base desktop terminfo (`TERM=xterm-256color` required). |
 
 ---
 
@@ -307,7 +333,10 @@ RestartSec=5
 WantedBy=default.target
 EOF
 
-# Step 2: Deploy unprivileged OpenSSH server on port 2222
+# Step 2: Authenticate Tailscale (CRITICAL: disable MagicDNS to preserve proxy routing)
+tailscale up --accept-dns=false --ssh
+
+# Step 3: Deploy unprivileged OpenSSH server on port 2222
 cat << 'EOF' > ~/.config/systemd/user/user-sshd.service
 [Unit]
 Description=User OpenSSH Server
@@ -324,7 +353,7 @@ RestartSec=5
 WantedBy=default.target
 EOF
 
-# Step 3: Forward Port 2222 over Tailnet
+# Step 4: Forward Port 2222 over Tailnet
 tailscale serve --bg --tcp 2222 127.0.0.1:2222
 ```
 
@@ -334,9 +363,12 @@ Protect sensitive files from multi-tenant cloud storage scans:
 2. Store the encryption key **exclusively on your local hardware**.
 3. All files written to the NFS storage tier are encrypted on the fly with **XChaCha20-Poly1305**. File names, folder paths, and contents appear as random binary ciphertext on the cloud storage appliance.
 
-### 4. Apply System Performance Tunables
+### 4. Apply System Performance & Terminfo Tunables
 Append to `~/.bashrc`:
 ```bash
+# Correct missing server terminfo definitions
+export TERM="xterm-256color"
+
 # Expand file descriptor limits
 ulimit -n 65536 2>/dev/null
 
