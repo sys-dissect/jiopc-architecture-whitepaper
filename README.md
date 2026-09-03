@@ -193,7 +193,7 @@ All benchmark tests were executed on the target instance under verified isolated
 | Benchmark Category      | Workload / Configuration          | Measured Result   |
 +-------------------------+-----------------------------------+-------------------+
 | Continuous Disk Write   | 100 GiB Direct Sync to NFS Array  | 581 MB/s sustained|
-| AI Matrix Inference     | Qwen 3.5 9B (INT4 via OpenVINO)   | 18-24 tokens/sec  |
+| AI Matrix Inference     | Qwen 3.5 9B (INT4 via OpenVINO)   | ~5.0 tokens/sec   |
 | Video Transcoding (AV1) | Intel SVT-AV1 1080p60 (Preset 7)  | 530% CPU load     |
 | Video Transcoding (HEVC)| libx265 1080p24 (Preset Fast)     | 22.0 FPS (Realtime)|
 | SSH Multiplexing        | ControlMaster Socket Reuse        | 0.25s (vs 1.93s)  |
@@ -214,7 +214,8 @@ All benchmark tests were executed on the target instance under verified isolated
 * **Model Parameters**: Qwen 3.5 9B (INT4 compressed weights, 5.8 GB on disk).
 * **Hardware Utilization**: AVX-512 VNNI dot-product vector pipelines across all 8 cores.
 * **Memory Footprint**: 7.2 GB RSS during continuous generation (comfortably inside 16 GB RAM).
-* **Generation Throughput**: **18 to 24 tokens per second** on pure CPU execution.
+* **Generation Throughput**: **~5.0 tokens per second** during continuous autoregressive token generation on pure CPU execution.
+* **The Memory Bandwidth Bottleneck**: While the AVX-512 VNNI execution units provide massive theoretical compute capacity (TOPS), autoregressive LLM decoding is strictly **memory-bandwidth bound**. Generating each token requires streaming the full ~5.8 GB model weights from system RAM into CPU caches. Bound by virtualized DDR4 memory bandwidth (~29 GB/s effective throughput), continuous token generation tops out at ~5.0 tokens/sec. Initial prompt ingestion (prefill), which is compute-bound, processes at higher rates.
 
 ### 3. Video Transcoding: Intel SVT-AV1 and libx265
 * **Intel SVT-AV1 (1080p 60FPS, Preset 7, CRF 28)**:
@@ -404,6 +405,6 @@ The JioPC virtual desktop represents an intriguing architectural paradox. While 
 
 ### The Verdict
 * **As a Consumer Browser Desktop**: Sub-optimal. Sufferers of the 15-minute idle timeout and browser rendering lag will find it frustrating for intensive interactive use.
-* **As an Unprivileged Remote Workstation**: Exceptional. When stripped of its browser GUI and accessed via user-space Tailscale and SSH, it provides **~660+ GFLOPS of AVX-512/VNNI compute**, **581 MB/s continuous disk writes**, and a rock-solid **18–24 tokens/sec inference engine for 9B parameter models**—at zero local power consumption.
+* **As an Unprivileged Remote Workstation**: Exceptional. When stripped of its browser GUI and accessed via user-space Tailscale and SSH, it provides **~660+ GFLOPS of AVX-512/VNNI compute**, **581 MB/s continuous disk writes**, and a functional **~5 tokens/sec CPU text generation engine for 9B parameter models (memory-bandwidth bound by virtualized DDR4)**—at zero local power consumption.
 
 With the persistent user-space configurations documented in this report, JioPC can be successfully repurposed into an indispensable asset in any developer or homelabber's infrastructure cluster.
