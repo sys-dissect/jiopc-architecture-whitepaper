@@ -120,7 +120,21 @@ flowchart TD
     end
 ```
 
-### 1. The 15-Minute Session Termination Guillotine
+### 1. The "No-Terminal" Walled Garden & The Flatpak Escape Hatch
+Stock JioPC instances are engineered to prevent users from accessing the underlying command-line interface:
+* **Missing Terminal Binaries**: The desktop environment completely omits standard Linux terminal emulators. Neither `gnome-terminal`, `xterm`, `qterminal`, `lxterminal`, nor `alacritty` are installed in `/usr/bin/`, and no terminal launcher exists in the desktop application menus.
+* **Security Through Obscurity**: The platform relies on the assumption that without a visible terminal emulator, consumer users cannot explore the system, inspect hardware, or execute unauthorized code.
+* **The Flatpak Trojan Horse**: To appeal to programmers, Jio provides development IDEs like **VSCodium** (`com.vscodium.codium`) in its software portal. However, for an IDE to compile and debug applications, its Flatpak sandbox manifest requires D-Bus communication with the host Flatpak session portal:
+  ```ini
+  --talk-name=org.freedesktop.Flatpak
+  ```
+* **The Breakout Mechanism**: By opening VSCodium and launching its integrated terminal, a user is initially dropped into VSCodium's sandboxed container. However, executing:
+  ```bash
+  flatpak-spawn --host bash
+  ```
+  instructs the host Flatpak portal daemon to spawn an unconfined shell directly within the host user's process space (`UID 3387120`). This grants immediate, unrestricted shell access to the underlying 8-core Xeon host, bypassing the artificial GUI restriction entirely.
+
+### 2. The 15-Minute Session Termination Guillotine
 The primary operational obstacle on JioPC is sudden session termination: users are logged out after brief periods of inactivity, destroying all active terminal jobs, background models, and running servers.
 
 #### Forensic Analysis of the XRDP Stack
@@ -132,12 +146,12 @@ The primary operational obstacle on JioPC is sudden session termination: users a
 3. **Synthetic Event Failure**: Traditional keep-alive scripts (`xdotool mousemove_relative`) fail completely because `libxorgxrdp.so` does not read local X11 input event queues to track idle time. It monitors **only raw incoming RDP network packets from the remote client** (`rdpInputMouseEvent`). Local synthetic input is completely invisible to the driver.
 4. **Logind User Slice Destruction**: In default configuration, `loginctl show-user` showed **`Linger=no`**. When XRDP terminates the graphical session, `systemd-logind` treats the user as completely logged out and issues a recursive `SIGKILL` across `user-3387120.slice`, killing every process spawned by the user.
 
-### 2. Multi-Tenant Shared Storage Privacy Hazards
+### 3. Multi-Tenant Shared Storage Privacy Hazards
 Because `/home/001217236281_0` resides on a centralized corporate NFS array (`storage-cons-prod-dp.jiopc.local`), storing sensitive datasets, proprietary intellectual property, or media collections in plaintext introduces significant security liabilities:
 * **Automated Scanners**: Enterprise cloud storage arrays routinely execute background deduplication, file-type indexing, and compliance hash-matching.
 * **Metadata Exposure**: Plaintext filenames, directories, and file sizes are visible to storage administrators and automated compliance crawlers.
 
-### 3. Missing Kernel Swap
+### 4. Missing Kernel Swap
 The system operates with **zero swap space**. In an 8-core machine running heavy multi-threaded workloads, memory fragmentation and sudden allocation spikes (e.g. loading large PyTorch models or uncompressed video frames) will immediately trigger the kernel OOM killer, killing processes without swap buffering.
 
 ---
@@ -219,6 +233,16 @@ graph LR
         G -->|ulimit + glibc tuning| I[Prevent OOM & File Exhaustion]
     end
 ```
+
+### 0. Initial Bootstrap: Escaping the Sandboxed GUI
+On a pristine, stock JioPC instance with no terminal emulator installed:
+1. Open the application portal and install **VSCodium**.
+2. Launch VSCodium and open its integrated terminal (`Ctrl + ~`).
+3. Break out of the Flatpak container into the unconfined host OS shell:
+   ```bash
+   flatpak-spawn --host bash
+   ```
+4. You now have direct interactive shell access to the host to configure lingering, Tailscale, and SSH.
 
 ### 1. Guarantee 24/7 Session Persistence
 Execute the following to prevent session termination when closing the web browser:
