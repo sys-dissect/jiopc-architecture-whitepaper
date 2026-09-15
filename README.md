@@ -15,7 +15,7 @@ JioPC is a commercial cloud virtual desktop infrastructure (VDI) solution target
 
 The instance is provisioned with an **8-vCPU Intel Xeon Platinum 8370C (Ice Lake-SP) processor featuring full AVX-512 and VNNI instruction sets**, **16 GB of RAM**, and an **enterprise NFSv4.1 multi-tenant network storage array capable of 581 MB/s continuous sustained write throughput**.
 
-However, the platform is severely throttled by consumer VDI enforcement mechanisms, notably an aggressive 15-minute network-idle session killswitch (`XRDP_SESMAN_KILL_DISCONNECTED=1`), disabled systemd lingering, zero administrative privileges (`sudo`), absence of `/dev/net/tun`, strict HTTP proxy egress filtering, and shared multi-tenant storage privacy risks.
+However, the platform is severely throttled by consumer VDI enforcement mechanisms, notably an aggressive 15-minute network-idle session killswitch (`XRDP_SESMAN_KILL_DISCONNECTED=1`), disabled systemd lingering, zero administrative privileges (`sudo`), stripped network capabilities (`CAP_NET_ADMIN` preventing `/dev/net/tun` interface instantiation), strict HTTP proxy egress filtering, and shared multi-tenant storage privacy risks.
 
 This whitepaper provides an objective, structured engineering dissection of the platform. It documents:
 1. The physical and virtual hardware architecture.
@@ -53,7 +53,7 @@ This whitepaper provides an objective, structured engineering dissection of the 
     | - Guest IP: 10.1.10.98 (Azure Virtual Network)                      |
     | - Outbound Filter: Direct TCP 80/443 BLOCKED                        |
     | - Mandatory Broker: px-proxy (127.0.0.1:3128) via Corporate PAC     |
-    | - Virtual Interfaces: /dev/net/tun ABSENT (CAP_NET_ADMIN Stripped)  |
+    | - Virtual Interfaces: /dev/net/tun (0666), CAP_NET_ADMIN Stripped   |
     +---------------------------------------------------------------------+
 ```
 
@@ -104,10 +104,10 @@ storage-cons-prod-dp.jiopc.local:/fs_cons_prod_119/001217236281/001217236281_0  
 * **Firewall Restrictions**: Direct outbound TCP traffic to external IPv4 addresses on standard ports (80, 443, 22) is dropped at the cloud security group boundary.
 * **Proxy Architecture**: All outbound internet connectivity is mediated through a local forward proxy broker (`px-proxy` / Squid on `127.0.0.1:3128`), which resolves authentication against an enterprise PAC cluster (`proxy-ngpr.jiopc.local:8080/proxy.pac`).
 * **Kernel Privilege Restrictions**:
-  * Unprivileged user UID `3387120`, GID `3387120`.
+  * Unprivileged user UID (e.g. `3387120`, `3500894`).
   * Sudo access: Strictly denied (`user is not in sudoers file`).
-  * Linux capabilities: Stripped (`cap_net_admin` and `cap_net_raw` are absent).
-  * TUN device: `/dev/net/tun` does not exist, blocking native OpenVPN and WireGuard kernel modules.
+  * Linux capabilities: Stripped (`CAP_NET_ADMIN` and `CAP_NET_RAW` are absent from user processes).
+  * Virtual Network Device: The device node `/dev/net/tun` physically exists with `0666` (`crw-rw-rw-`) permissions and can be opened for reading and writing by any unprivileged user. However, calling `ioctl(fd, TUNSETIFF, ...)` fails with `EPERM` (`Operation not permitted`) because the kernel requires `CAP_NET_ADMIN` to attach or configure a virtual network interface. Consequently, native kernel-space VPNs (OpenVPN, WireGuard) cannot instantiate interfaces, necessitating userspace networking implementations.
 
 ---
 
@@ -128,19 +128,28 @@ flowchart TD
     end
 ```
 
-### 1. The "No-Terminal" Walled Garden & The Flatpak Escape Hatch
+### 1. The "No-Terminal" Walled Garden & Host Shell Ingress Vectors
 Stock JioPC instances are engineered to prevent users from accessing the underlying command-line interface:
 * **Missing Terminal Binaries**: The desktop environment completely omits standard Linux terminal emulators. Neither `gnome-terminal`, `xterm`, `qterminal`, `lxterminal`, nor `alacritty` are installed in `/usr/bin/`, and no terminal launcher exists in the desktop application menus.
 * **Security Through Obscurity**: The platform relies on the assumption that without a visible terminal emulator, consumer users cannot explore the system, inspect hardware, or execute unauthorized code.
-* **The Flatpak Trojan Horse**: To appeal to programmers, Jio provides development IDEs like **VSCodium** (`com.vscodium.codium`) in its software portal. However, for an IDE to compile and debug applications, its Flatpak sandbox manifest requires D-Bus communication with the host Flatpak session portal:
+* **Vector A — Blind Scripting & Loopback WebSockets (`ttyd` + Chrome)**:
+  Because user-space script execution is permitted within the user's home directory, command staging can be initiated blindly (e.g., executing a script via file-manager launcher or allowed runtimes like Python 3 and redirecting stdout to `~/Desktop/output.txt`). By fetching a statically compiled web terminal daemon (`ttyd`) into `/tmp` and binding it to a local loopback port (`127.0.0.1:9999`), an interactive pseudo-terminal (PTY) session is exposed. Because the pre-installed Google Chrome browser (`/opt/google/chrome/chrome`) is an allowed application, navigating to the loopback address tunnels a fully interactive bash shell over WebSockets directly inside a standard browser tab. This provides zero-dependency host shell access without requiring IDE installation or root privileges.
+* **Vector B — The Flatpak Trojan Horse & The Hidden Pre-Installed IDEs**:
+  While early versions of the platform exposed development IDEs like **VSCodium** (`com.vscodium.codium`) in the user-facing Jio Software Center (`jiopc-store`), recent platform updates removed all developer IDEs (VSCodium, Code-OSS, PyCharm Community) from the store's visual catalog. However, filesystem forensics on the secondary SSD (`/mnt/sfdisk`, housing `/var/lib/flatpak`) reveal that these packages were **never uninstalled**—they remain baked into the underlying system image:
+  * `com.vscodium.codium` (v1.104.16282)
+  * `com.visualstudio.code-oss` (v1.74.3)
+  * `com.jetbrains.PyCharm-Community` (v2024.3.4)
+  * `org.codeblocks.codeblocks`, `org.eclipse.Java`, `org.geany.Geany`
+
+  Because the Software Center hides these entries and no terminal emulator is available to run CLI commands, consumer users cannot discover or launch them. However, once an unprivileged interactive shell is acquired via Vector A, any of these IDEs can be executed directly (e.g., `flatpak run com.vscodium.codium &`). Furthermore, for an IDE to compile and debug applications, its Flatpak sandbox manifest requires D-Bus communication with the host Flatpak session portal:
   ```ini
   --talk-name=org.freedesktop.Flatpak
   ```
-* **The Breakout Mechanism**: By opening VSCodium and launching its integrated terminal, a user is initially dropped into VSCodium's sandboxed container. However, executing:
+  Executing:
   ```bash
   flatpak-spawn --host bash
   ```
-  instructs the host Flatpak portal daemon to spawn an unconfined shell directly within the host user's process space (`UID 3387120`). This grants immediate, unrestricted shell access to the underlying 8-core Xeon host, bypassing the artificial GUI restriction entirely.
+  from inside VSCodium's integrated terminal instructs the host Flatpak portal daemon to spawn an unconfined shell directly within the host user's process space.
 
 ### 2. The 15-Minute Session Termination Guillotine
 The primary operational obstacle on JioPC is sudden session termination: users are logged out after brief periods of inactivity, destroying all active terminal jobs, background models, and running servers.
@@ -152,7 +161,8 @@ The primary operational obstacle on JioPC is sudden session termination: users a
    * `XRDP_SESMAN_KILL_DISCONNECTED=1` (Forces session teardown on client disconnect).
    * `XRDP_SESMAN_AUDIO_DISABLE_IDLETIMEOUT=1` (Audio activity pauses the idle counter).
 3. **Synthetic Event Failure**: Traditional keep-alive scripts (`xdotool mousemove_relative`) fail completely because `libxorgxrdp.so` does not read local X11 input event queues to track idle time. It monitors **only raw incoming RDP network packets from the remote client** (`rdpInputMouseEvent`). Local synthetic input is completely invisible to the driver.
-4. **Logind User Slice Destruction**: In default configuration, `loginctl show-user` showed **`Linger=no`**. When XRDP terminates the graphical session, `systemd-logind` treats the user as completely logged out and issues a recursive `SIGKILL` across `user-3387120.slice`, killing every process spawned by the user.
+4. **Logind User Slice Destruction**: In default configuration, `loginctl show-user` showed **`Linger=no`**. When XRDP terminates the graphical session, `systemd-logind` treats the user as completely logged out and issues a recursive `SIGKILL` across the user's systemd slice, killing every process spawned by the user.
+5. **Modern PipeWire Audio Architecture**: The audio subsystem runs **PipeWire** (`pipewire`, `pipewire-pulse`) with the module `libpipewire-module-xrdp-pipewire`. PipeWire streams map audio flows into the XRDP idle-timeout control socket (`/var/run/xrdp/$UID/xrdp_idle_timeout_data_flow_${DISPLAY_NUM:-10}`). Transmitting keep-alive datagrams directly to this socket safely suppresses XRDP's idle killswitch.
 
 ### 3. Multi-Tenant Shared Storage Privacy Hazards
 Because `/home/001217236281_0` resides on a centralized corporate NFS array (`storage-cons-prod-dp.jiopc.local`), storing sensitive datasets, proprietary intellectual property, or media collections in plaintext introduces significant security liabilities:
@@ -238,8 +248,8 @@ All benchmark tests were executed on the target instance under verified isolated
 | **Compute & CPU** | • Enterprise Intel Ice Lake architecture.<br/>• Full **AVX-512 and VNNI** vector instruction sets.<br/>• CPU governor locked to **`performance`** (no downclocking).<br/>• Excellent CPU-based AI inference & video transcoding. | • 8 virtual cores limited to single socket.<br/>• No dedicated GPU / NPU hardware accelerator.<br/>• **Ephemeral node recycling**: Local `/tmp` and OS root wiped between sessions.<br/>• No CPU core pin isolation between vCPUs. |
 | **Memory** | • 16 GB capacity supports 7B–9B quantized LLMs.<br/>• Transparent Huge Pages (`THP`) enabled for low TLB overhead. | • **0 MB Swap**: Instant process termination upon memory exhaustion.<br/>• Multi-threaded apps risk heap fragmentation (64 default arenas). |
 | **Storage** | • **581 MB/s continuous sustained write speed** over NFS.<br/>• Fast 4K random latency (0.01 ms on local SSD).<br/>• Generous 1 TB user plan quota.<br/>• 128 GB secondary SSD (`/mnt/sfdisk`) with 100+ pre-installed apps. | • `df -h` reporting quirk shows shared 100 TB multi-tenant pool.<br/>• Plaintext data on enterprise NFS risks compliance/audit scanning.<br/>• Writing thousands of tiny files over NFS suffers from RPC latency. |
-| **Networking** | • High-bandwidth internal datacenter pipe.<br/>• Supports userspace WireGuard mesh via Tailscale.<br/>• Headless SSH bypasses WebRTC video streaming. | • **Direct outbound HTTP/HTTPS blocked** (must use `127.0.0.1:3128`).<br/>• `/dev/net/tun` absent; standard VPNs cannot initialize.<br/>• **MagicDNS deadlock**: VPN DNS overrides break proxy PAC resolution.<br/>• Inbound ports strictly blocked by cloud security groups. |
-| **Session & OS** | • Full systemd user session manager available.<br/>• Lingering can be enabled to persist background services.<br/>• Trivially accessible host shell via Flatpak escape. | • Default **15-minute network-idle session killswitch**.<br/>• WebRTC browser client **intercepts keystrokes** (`Ctrl+W`, `Ctrl+T`).<br/>• Zero administrative (`sudo`) access; cannot install `.deb` packages.<br/>• Server image lacks base desktop terminfo (`TERM=xterm-256color` required). |
+| **Networking** | • High-bandwidth internal datacenter pipe.<br/>• Supports userspace WireGuard mesh via Tailscale.<br/>• Headless SSH bypasses WebRTC video streaming. | • **Direct outbound HTTP/HTTPS blocked** (must use `127.0.0.1:3128`).<br/>• **`CAP_NET_ADMIN` stripped**; `ioctl(TUNSETIFF)` fails on `/dev/net/tun` (kernel VPNs cannot initialize).<br/>• **MagicDNS deadlock**: VPN DNS overrides break proxy PAC resolution.<br/>• Inbound ports strictly blocked by cloud security groups. |
+| **Session & OS** | • Full systemd user session manager available.<br/>• Lingering can be enabled to persist background services.<br/>• Trivially accessible host shell via loopback Web TTY (`ttyd` + Chrome) or Flatpak escape. | • Default **15-minute network-idle session killswitch**.<br/>• WebRTC browser client **intercepts keystrokes** (`Ctrl+W`, `Ctrl+T`).<br/>• Zero administrative (`sudo`) access; cannot install `.deb` packages.<br/>• Server image lacks base desktop terminfo (`TERM=xterm-256color` required). |
 
 ---
 
@@ -250,26 +260,73 @@ To convert this restricted VDI desktop into an enterprise-grade 24/7 headless wo
 ```mermaid
 graph LR
     subgraph Core Workarounds
-        A[Session Persistence] -->|loginctl enable-linger| B[Survive VDI Logout]
+        Z[Initial Bootstrap] -->|ttyd + Chrome / Flatpak| A0[Interactive Host Shell]
+        A0 --> A[Session Persistence]
+        A -->|loginctl enable-linger| B[Survive VDI Logout]
         A -->|Audio Heartbeat Socket| C[Bypass 15-min XRDP Kill]
         
-        D[Remote Connectivity] -->|Userspace Tailscale| E[Bypass TUN & Firewall]
+        A0 --> D[Remote Connectivity]
+        D -->|Userspace Tailscale| E[Bypass TUN & Firewall]
         D -->|User sshd on Port 2222| F[Zero-Lag Terminal / VS Code]
         
-        G[Storage & Memory] -->|rclone crypt| H[Zero-Knowledge Cloud Vault]
+        A0 --> G[Storage & Memory]
+        G -->|rclone crypt| H[Zero-Knowledge Cloud Vault]
         G -->|ulimit + glibc tuning| I[Prevent OOM & File Exhaustion]
     end
 ```
 
-### 0. Initial Bootstrap: Escaping the Sandboxed GUI
-On a pristine, stock JioPC instance with no terminal emulator installed:
-1. Open the application portal and install **VSCodium**.
-2. Launch VSCodium and open its integrated terminal (`Ctrl + ~`).
-3. Break out of the Flatpak container into the unconfined host OS shell:
+### 0. Initial Bootstrap: Acquiring an Interactive Shell
+
+Because stock JioPC instances omit standard terminal emulators, establishing an interactive shell requires bypassing the graphical restriction. Two proven vectors achieve this:
+
+#### Method 1: Blind Execution & Loopback Web TTY (`ttyd` + Chrome) [Primary / Zero-Dependency]
+
+This method operates with zero external dependencies and does not rely on Flatpak or application portal availability.
+
+* **Phase 1: Initial Access (Blind Execution)**  
+  Initial footprinting is achieved by leveraging a user-writable execution script (e.g., `run.sh` or a custom `.desktop` launcher placed on `~/Desktop`). By piping diagnostic command output directly to a text file:
+  ```bash
+  uname -a > ~/Desktop/output.txt
+  ps aux >> ~/Desktop/output.txt
+  id >> ~/Desktop/output.txt
+  ```
+  the internal process tree, network topology, and VDI architecture can be fully mapped without requiring an open terminal window.
+
+* **Phase 2: GUI Evasion & Blind Shell Pivot**  
+  Following the discovery that standard terminal packages are restricted, a blind shell is established by repurposing pre-installed scripting runtimes (such as Python 3 or `zenity`). This provides basic execution capability to stage network payloads and scripts.
+
+* **Phase 3: Payload Delivery (`ttyd`)**  
+  Using the blind execution method, a statically compiled binary of the open-source web terminal utility [`ttyd`](https://github.com/tsl0922/ttyd) (v1.7.7) is fetched directly into `/tmp` via `wget` and marked executable:
+  ```bash
+  wget -qO /tmp/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64
+  chmod +x /tmp/ttyd
+  ```
+
+* **Phase 4: Interactive Pivot (Browser-Based Web TTY)**  
+  To establish a fully interactive TTY, the `ttyd` daemon is executed with write permissions enabled (`-W`) and bound to a local loopback port:
+  ```bash
+  /tmp/ttyd -W -p 9999 bash &
+  ```
+  Because the pre-installed Google Chrome browser (`/opt/google/chrome/chrome`) is an allowed application, navigating to `http://127.0.0.1:9999` opens a responsive pseudo-terminal (PTY) inside a browser tab. This successfully bypasses the VDI's terminal restrictions by tunneling the bash shell over local WebSockets directly into the browser.
+
+* **Post-Bootstrap Tooling & AI Agent Workflows**  
+  Once the interactive read/write shell is established in the browser tab, the environment can be prepared for advanced developer workflows. Modern agentic tooling, such as the Antigravity CLI (`agy`), along with `tmux` and language package managers, can be fetched, installed, and configured directly within the terminal tab. This creates a fully functional, AI-assisted development workflow running entirely inside the desktop instance.
+
+---
+
+#### Method 2: Launching Pre-Installed Flatpak IDEs & Session Breakout [Alternative]
+
+While the Jio Software Center UI has removed user-facing listings for developer IDEs, popular IDE packages are **already pre-installed system-wide** on the secondary SSD (`/mnt/sfdisk`). Once an interactive shell is obtained via Method 1:
+1. Launch the pre-installed VSCodium or Code-OSS:
+   ```bash
+   flatpak run com.vscodium.codium &
+   ```
+2. Open its integrated terminal (`Ctrl + ~`).
+3. If operating within the Flatpak sandbox, break out into the host OS shell:
    ```bash
    flatpak-spawn --host bash
    ```
-4. You now have direct interactive shell access to the host to configure lingering, Tailscale, and SSH.
+4. You now have direct interactive shell access to the host.
 
 ### 1. Guarantee 24/7 Session Persistence
 Execute the following to prevent session termination when closing the web browser:
