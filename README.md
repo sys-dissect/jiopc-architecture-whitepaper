@@ -36,21 +36,22 @@ This whitepaper provides an objective, structured engineering dissection of the 
     +----------------------------------+----------------------------------+
     | Compute Subsystem                | Memory Subsystem                 |
     | - Intel Xeon Platinum 8370C      | - 16 GB DDR4/DDR5 Virtual RAM    |
-    | - 8 vCPUs (1 Socket, 8 Cores)    | - NUMA Node 0                    |
-    | - AVX-512 F/BW/DQ/VL + VNNI      | - Transparent Huge Pages: Always |
-    | - Governor: 'performance'        | - Swap: 0 MB (Hard Limit)        |
+    | - 8 vCPUs (1 Socket, 4 Cores/8T) | - NUMA Node 0                    |
+    | - VM SKU: Standard_D8ls_v5       | - Transparent Huge Pages: Always |
+    | - AVX-512 F/BW/DQ/VL + VNNI      | - Swap: 0 MB (Hard Limit)        |
+    | - Governor: 'performance'        |                                  |
     +----------------------------------+----------------------------------+
                                        |
     +----------------------------------+----------------------------------+
     | Tri-Tier Storage Architecture                                       |
-    | Tier 1: Local Virtual OS SSD (/dev/sda1)     -> 64 GB Ext4 (104 MB/s W) |
-    | Tier 2: Local Ephemeral Scratch (/dev/sdb1)  -> 128 GB Ext4 (Flatpaks)  |
+    | Tier 1: Local Virtual OS SSD (/dev/sdb1)     -> 64 GB Ext4 (104 MB/s W) |
+    | Tier 2: Managed App Storage (/dev/sda1)      -> 128 GB Ext4 (Flatpaks)  |
     | Tier 3: Enterprise Cloud NFS (storage-cons)  -> 100 TB Pool (581 MB/s W)|
     +----------------------------------+----------------------------------+
                                        |
     +----------------------------------+----------------------------------+
     | Network & Perimeter Controls                                        |
-    | - Guest IP: 10.1.10.98 (Azure Virtual Network)                      |
+    | - Guest Subnet: 10.1.0.0/19 (Azure Virtual Network)                 |
     | - Outbound Filter: Direct TCP 80/443 BLOCKED                        |
     | - Mandatory Broker: px-proxy (127.0.0.1:3128) via Corporate PAC     |
     | - Virtual Interfaces: /dev/net/tun (0666), CAP_NET_ADMIN Stripped   |
@@ -59,10 +60,12 @@ This whitepaper provides an objective, structured engineering dissection of the 
 
 ### 1. Compute Subsystem & Ephemeral Node Recycling
 * **Processor Architecture**: Intel Xeon Platinum 8370C CPU @ 2.80 GHz (Family 6, Model 106, Stepping 6).
+* **Cloud Instance SKU**: Microsoft Azure **`Standard_D8ls_v5`** (low-memory compute-optimized instance).
 * **Process Technology**: Intel 10nm Ice Lake-SP Server Architecture.
-* **Virtual Core Topology**: 8 vCPUs configured as 1 single physical socket with 8 dedicated cores (1 execution thread per core, no SMT oversubscription observed in baseline benchmarks).
-* **Decoupled Compute Fabric & Node Recycling**: Compute instances are **ephemeral, disposable worker nodes** allocated dynamically from a shared cloud pool. Hostnames cycle across sessions (e.g., `JPC8VCF-0159` → `JPC8VCF-0229` → `JPC8VCF-0184` → `JPC8VCF-0001`). 
+* **Virtual Core Topology**: 8 vCPUs configured as 1 single virtual socket with 4 physical cores and 2 threads per core (Hyper-Threading / SMT enabled).
+* **Decoupled Compute Fabric & Node Recycling**: Compute instances are **ephemeral, disposable worker nodes** allocated dynamically from a shared cloud pool. Hostnames cycle across sessions (e.g., `JPC8VCF-0159` → `JPC8VCF-0229` → `JPC8VCF-0184` → `mjyjp-0129`). 
   * **Architectural Implication**: Any filesystem changes made outside of `$HOME` (e.g., in `/tmp`, `/var`, or `/usr`) are **permanently destroyed upon pool recycling**.
+  * **Ephemeral Lingering State**: The systemd user lingering state (`/var/lib/systemd/linger/`) resides on the local ephemeral root disk. When a compute node is recycled, lingering resets to disabled until re-invoked on the new node (necessitating automated re-enablement via login/profile hooks).
   * **Persistence Anchor**: Only `$HOME` (mounted via NFSv4.1) is stateful across sessions. All custom binaries, environment files, user systemd units, and Tailscale states must reside under `$HOME` to survive node recreation.
 * **Hardware Accelerators**:
   * **AVX-512 Vector Extensions**: Complete support for `AVX-512F` (Foundation), `AVX-512CD` (Conflict Detection), `AVX-512BW` (Byte/Word), `AVX-512DQ` (Doubleword/Quadword), and `AVX-512VL` (Vector Length orthogonal extensions).
@@ -83,9 +86,9 @@ This whitepaper provides an objective, structured engineering dissection of the 
 The instance exposes three independent storage tiers:
 
 | Storage Tier | Mount Point | Physical Device | Filesystem | Form Factor | Benchmarked Write | Benchmarked Read | Purpose |
-| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Tier 1: OS Root** | `/` | `/dev/sda1` | Ext4 | Azure Virtual SSD | **104 MB/s** | **506 MB/s** | Base OS, system binaries, `/tmp` |
-| **Tier 2: Scratch** | `/mnt/sfdisk` | `/dev/sdb1` | Ext4 | Azure Ephemeral SSD| **180 MB/s** | **650 MB/s** | Flatpak applications pool |
+| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :--- |
+| **Tier 1: OS Root** | `/` | `/dev/sdb1` | Ext4 | Azure Virtual SSD (Standard_LRS) | **104 MB/s** | **506 MB/s** | Base OS, system binaries, `/tmp` |
+| **Tier 2: App Pool** | `/mnt/sfdisk` | `/dev/sda1` | Ext4 | Azure Data Disk (Standard_LRS) | **180 MB/s** | **650 MB/s** | Flatpak applications pool |
 | **Tier 3: Cloud Vault** | `/home/...` | NFSv4.1 Network Array | NFSv4.1 | NetApp / Isilon Cluster | **581 MB/s** | **6+ GB/s (cached)**| User persistent home directory |
 
 #### The "100 TB Multi-Tenant Storage" Anomaly Explained
@@ -140,6 +143,7 @@ Stock JioPC instances are engineered to prevent users from accessing the underly
   * `com.visualstudio.code-oss` (v1.74.3)
   * `com.jetbrains.PyCharm-Community` (v2024.3.4)
   * `org.codeblocks.codeblocks`, `org.eclipse.Java`, `org.geany.Geany`
+  * `uk.org.greenend.chiark.sgtatham.putty` (v0.83 — pre-installed GUI terminal emulator/SSH client, launchable via `flatpak run uk.org.greenend.chiark.sgtatham.putty &`)
 
   Because the Software Center hides these entries and no terminal emulator is available to run CLI commands, consumer users cannot discover or launch them. However, once an unprivileged interactive shell is acquired via Vector A, any of these IDEs can be executed directly (e.g., `flatpak run com.vscodium.codium &`). Furthermore, for an IDE to compile and debug applications, its Flatpak sandbox manifest requires D-Bus communication with the host Flatpak session portal:
   ```ini
@@ -157,12 +161,13 @@ The primary operational obstacle on JioPC is sudden session termination: users a
 #### Forensic Analysis of the XRDP Stack
 1. **Ruling Out OOM and Kernel Crashes**: Examination of `/var/log/syslog`, `dmesg`, and `systemd-journald` verified continuous uptime (>16 hours) with zero kernel panics and zero OOM events (`oomctl` pressure score: 0).
 2. **Decompilation of `libxorgxrdp.so`**: Decompiling the X11 XRDP driver (`/usr/lib/xorg/modules/libxorgxrdp.so`) revealed hardcoded session management environment overrides:
-   * `XRDP_SESMAN_MAX_IDLE_TIME=900` (Strict 900-second / 15-minute idle limit).
-   * `XRDP_SESMAN_KILL_DISCONNECTED=1` (Forces session teardown on client disconnect).
+   * `XRDP_SESMAN_MAX_IDLE_TIME=900` (Strict 900-second / 15-minute idle limit while connected).
+   * `XRDP_SESMAN_KILL_DISCONNECTED=1` (Forces session teardown immediately upon client disconnect).
+   * `XRDP_SESMAN_MAX_DISC_TIME=900` (900-second disconnect timeout fallback).
    * `XRDP_SESMAN_AUDIO_DISABLE_IDLETIMEOUT=1` (Audio activity pauses the idle counter).
 3. **Synthetic Event Failure**: Traditional keep-alive scripts (`xdotool mousemove_relative`) fail completely because `libxorgxrdp.so` does not read local X11 input event queues to track idle time. It monitors **only raw incoming RDP network packets from the remote client** (`rdpInputMouseEvent`). Local synthetic input is completely invisible to the driver.
 4. **Logind User Slice Destruction**: In default configuration, `loginctl show-user` showed **`Linger=no`**. When XRDP terminates the graphical session, `systemd-logind` treats the user as completely logged out and issues a recursive `SIGKILL` across the user's systemd slice, killing every process spawned by the user.
-5. **Modern PipeWire Audio Architecture**: The audio subsystem runs **PipeWire** (`pipewire`, `pipewire-pulse`) with the module `libpipewire-module-xrdp-pipewire`. PipeWire streams map audio flows into the XRDP idle-timeout control socket (`/var/run/xrdp/$UID/xrdp_idle_timeout_data_flow_${DISPLAY_NUM:-10}`). Transmitting keep-alive datagrams directly to this socket safely suppresses XRDP's idle killswitch.
+5. **Modern PipeWire Audio Architecture**: The audio subsystem runs **PipeWire** (`pipewire`, `pipewire-pulse`) with the module `libpipewire-module-xrdp-pipewire`. PipeWire streams map audio flows into the XRDP idle-timeout control socket (`/var/run/xrdp/$UID/xrdp_idle_timeout_data_flow_${DISPLAY_NUM:-10}`). This socket is an unprivileged UNIX domain **stream socket** (`SOCK_STREAM`). Transmitting keep-alive stream connections directly to this socket safely suppresses XRDP's idle killswitch while the browser is open. When the browser is disconnected, `XRDP_SESMAN_KILL_DISCONNECTED=1` will still terminate the X11 display, but background processes survive via systemd lingering.
 
 ### 3. Multi-Tenant Shared Storage Privacy Hazards
 Because `/home/001217236281_0` resides on a centralized corporate NFS array (`storage-cons-prod-dp.jiopc.local`), storing sensitive datasets, proprietary intellectual property, or media collections in plaintext introduces significant security liabilities:
@@ -245,7 +250,7 @@ All benchmark tests were executed on the target instance under verified isolated
 
 | Dimension | Strengths & Capabilities | Weaknesses & Architectural Bottlenecks |
 | :--- | :--- | :--- |
-| **Compute & CPU** | • Enterprise Intel Ice Lake architecture.<br/>• Full **AVX-512 and VNNI** vector instruction sets.<br/>• CPU governor locked to **`performance`** (no downclocking).<br/>• Excellent CPU-based AI inference & video transcoding. | • 8 virtual cores limited to single socket.<br/>• No dedicated GPU / NPU hardware accelerator.<br/>• **Ephemeral node recycling**: Local `/tmp` and OS root wiped between sessions.<br/>• No CPU core pin isolation between vCPUs. |
+| **Compute & CPU** | • Enterprise Intel Ice Lake architecture.<br/>• Full **AVX-512 and VNNI** vector instruction sets.<br/>• CPU governor locked to **`performance`** (no downclocking).<br/>• Excellent CPU-based AI inference & video transcoding. | • 8 vCPUs (4 physical cores, 2 threads/core SMT on `Standard_D8ls_v5`).<br/>• SMT thread contention on vector units requires thread pinning.<br/>• No dedicated GPU / NPU hardware accelerator.<br/>• **Ephemeral node recycling**: Local `/tmp`, `/var` (and linger flag) wiped between sessions. |
 | **Memory** | • 16 GB capacity supports 7B–9B quantized LLMs.<br/>• Transparent Huge Pages (`THP`) enabled for low TLB overhead. | • **0 MB Swap**: Instant process termination upon memory exhaustion.<br/>• Multi-threaded apps risk heap fragmentation (64 default arenas). |
 | **Storage** | • **581 MB/s continuous sustained write speed** over NFS.<br/>• Fast 4K random latency (0.01 ms on local SSD).<br/>• Generous 1 TB user plan quota.<br/>• 128 GB secondary SSD (`/mnt/sfdisk`) with 100+ pre-installed apps. | • `df -h` reporting quirk shows shared 100 TB multi-tenant pool.<br/>• Plaintext data on enterprise NFS risks compliance/audit scanning.<br/>• Writing thousands of tiny files over NFS suffers from RPC latency. |
 | **Networking** | • High-bandwidth internal datacenter pipe.<br/>• Supports userspace WireGuard mesh via Tailscale.<br/>• Headless SSH bypasses WebRTC video streaming. | • **Direct outbound HTTP/HTTPS blocked** (must use `127.0.0.1:3128`).<br/>• **`CAP_NET_ADMIN` stripped**; `ioctl(TUNSETIFF)` fails on `/dev/net/tun` (kernel VPNs cannot initialize).<br/>• **MagicDNS deadlock**: VPN DNS overrides break proxy PAC resolution.<br/>• Inbound ports strictly blocked by cloud security groups. |
@@ -329,24 +334,28 @@ While the Jio Software Center UI has removed user-facing listings for developer 
 4. You now have direct interactive shell access to the host.
 
 ### 1. Guarantee 24/7 Session Persistence
-Execute the following to prevent session termination when closing the web browser:
+Execute the following to ensure background processes and daemons survive when closing the web browser:
 
 ```bash
-# Step 1: Enable systemd user lingering
-loginctl enable-linger 3387120
+# Step 1: Enable systemd user lingering (persists user systemd daemon across logouts)
+loginctl enable-linger $USER
 
 # Step 2: Deploy the Audio-Socket Heartbeat Daemon
 mkdir -p ~/bin ~/.config/systemd/user
 cat << 'EOF' > ~/bin/keep-awake.sh
 #!/usr/bin/env bash
+USER_ID="$(id -u)"
+# Auto-heal systemd linger across ephemeral compute node reassignments
+loginctl enable-linger "$USER" 2>/dev/null || true
+
 while true; do
-    DISPLAY_NUM="${DISPLAY#*:}"
-    DISPLAY_NUM="${DISPLAY_NUM%%.*}"
-    AUDIO_SOCKET="/var/run/xrdp/$UID/xrdp_idle_timeout_data_flow_${DISPLAY_NUM:-10}"
-    if [ -S "$AUDIO_SOCKET" ]; then
-        printf "sound_playing" | nc -U -u -w 1 "$AUDIO_SOCKET" 2>/dev/null || true
-    fi
-    xset s off s 0 0 -dpms 2>/dev/null || true
+    # Reset Accops XRDP idle timeout via UNIX domain stream socket
+    for sock in /var/run/xrdp/"$USER_ID"/xrdp_idle_timeout_data_flow_*; do
+        if [ -S "$sock" ]; then
+            printf "sound_playing" | nc -U -w 1 "$sock" 2>/dev/null || true
+        fi
+    done
+    DISPLAY="${DISPLAY:-:10.0}" xset s off s 0 0 -dpms 2>/dev/null || true
     sleep 30
 done
 EOF
@@ -356,9 +365,10 @@ chmod +x ~/bin/keep-awake.sh
 cat << 'EOF' > ~/.config/systemd/user/keep-awake.service
 [Unit]
 Description=XRDP Idle Timeout Bypass Daemon
-After=graphical-session.target
+After=default.target
 
 [Service]
+Type=simple
 ExecStart=%h/bin/keep-awake.sh
 Restart=always
 RestartSec=10
@@ -369,20 +379,35 @@ EOF
 systemctl --user daemon-reload && systemctl --user enable --now keep-awake.service
 ```
 
+> [!NOTE]
+> Poking the audio stream socket suppresses XRDP's 15-minute connected idle killswitch (`XRDP_SESMAN_MAX_IDLE_TIME=900`). If you disconnect or close your browser tab, `XRDP_SESMAN_KILL_DISCONNECTED=1` will still terminate the X11 GUI session; however, because `enable-linger` is active, `systemd-logind` will **not** kill your user processes. All background services (Tailscale, SSH, long-running compilations, AI models) remain permanently active.
+
 ### 2. Configure Headless Zero-Lag Remote Access (Tailscale + SSH)
 Bypass the web browser completely and connect directly via native terminal or VS Code Remote-SSH:
 
 ```bash
+# Step 0: Download and unpack Tailscale binaries in user space
+mkdir -p ~/bin ~/.local/share/tailscale
+curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.74.0_amd64.tgz | tar -xz -C /tmp
+mv /tmp/tailscale_*/tailscale* ~/bin/
+rm -rf /tmp/tailscale_*
+
 # Step 1: Run Tailscale in userspace networking mode under systemd
 cat << 'EOF' > ~/.config/systemd/user/tailscaled.service
 [Unit]
 Description=Tailscale Node Agent (Userspace)
 After=network.target
+Wants=network.target
 
 [Service]
 Type=simple
-Environment="HTTP_PROXY=http://127.0.0.1:3128" "HTTPS_PROXY=http://127.0.0.1:3128"
-ExecStart=%h/bin/tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1056 --socket=%h/tailscaled.sock --statedir=%h/.local/share/tailscale
+Environment="HTTP_PROXY=http://proxy-ngpr.jiopc.local:3128"
+Environment="HTTPS_PROXY=http://proxy-ngpr.jiopc.local:3128"
+Environment="http_proxy=http://proxy-ngpr.jiopc.local:3128"
+Environment="https_proxy=http://proxy-ngpr.jiopc.local:3128"
+Environment="NO_PROXY=localhost,127.0.0.1,::1,proxy-ngpr.jiopc.local,10.0.8.101"
+Environment="no_proxy=localhost,127.0.0.1,::1,proxy-ngpr.jiopc.local,10.0.8.101"
+ExecStart=%h/bin/tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1056 --socket=%h/tailscaled.sock --statedir=%h/.local/share/tailscale --state=%h/.local/share/tailscale/tailscaled.state
 LimitNOFILE=65536
 Restart=always
 RestartSec=5
@@ -390,11 +415,35 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 EOF
+systemctl --user daemon-reload && systemctl --user enable --now tailscaled.service
 
-# Step 2: Authenticate Tailscale (CRITICAL: disable MagicDNS to preserve proxy routing)
-tailscale up --accept-dns=false --ssh
+# Step 2: Configure CLI alias and authenticate Tailscale
+# (CRITICAL: disable MagicDNS to preserve local forward proxy routing)
+alias tailscale='tailscale --socket=$HOME/tailscaled.sock'
+tailscale --socket=$HOME/tailscaled.sock up --accept-dns=false --ssh
 
-# Step 3: Deploy unprivileged OpenSSH server on port 2222
+# Step 3: Generate unprivileged host keys and configure SSH server
+mkdir -p ~/.ssh/host_keys
+ssh-keygen -t ed25519 -f ~/.ssh/host_keys/ssh_host_ed25519_key -N ""
+
+cat << 'EOF' > ~/.ssh/sshd_config_user
+Port 2222
+ListenAddress 127.0.0.1
+HostKey %h/.ssh/host_keys/ssh_host_ed25519_key
+AuthorizedKeysFile %h/.ssh/authorized_keys
+StrictModes no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+UseDNS no
+PidFile %h/sshd.pid
+ClientAliveInterval 30
+ClientAliveCountMax 3
+EOF
+chmod 600 ~/.ssh/sshd_config_user ~/.ssh/host_keys/*
+
+# Step 4: Deploy unprivileged OpenSSH server on port 2222
 cat << 'EOF' > ~/.config/systemd/user/user-sshd.service
 [Unit]
 Description=User OpenSSH Server
@@ -410,9 +459,10 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 EOF
+systemctl --user daemon-reload && systemctl --user enable --now user-sshd.service
 
-# Step 4: Forward Port 2222 over Tailnet
-tailscale serve --bg --tcp 2222 127.0.0.1:2222
+# Step 5: Forward Port 2222 over Tailnet
+tailscale --socket=$HOME/tailscaled.sock serve --bg --tcp 2222 127.0.0.1:2222
 ```
 
 ### 3. Deploy Zero-Knowledge Storage Encryption (`rclone crypt`)
