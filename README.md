@@ -145,15 +145,10 @@ Stock JioPC instances are engineered to prevent users from accessing the underly
   * `org.codeblocks.codeblocks`, `org.eclipse.Java`, `org.geany.Geany`
   * `uk.org.greenend.chiark.sgtatham.putty` (v0.83 — pre-installed GUI terminal emulator/SSH client, launchable via `flatpak run uk.org.greenend.chiark.sgtatham.putty &`)
 
-  Because the Software Center hides these entries and no terminal emulator is available to run CLI commands, consumer users cannot discover or launch them. However, once an unprivileged interactive shell is acquired via Vector A, any of these IDEs can be executed directly (e.g., `flatpak run com.vscodium.codium &`). Furthermore, for an IDE to compile and debug applications, its Flatpak sandbox manifest requires D-Bus communication with the host Flatpak session portal:
-  ```ini
-  --talk-name=org.freedesktop.Flatpak
-  ```
-  Executing:
-  ```bash
-  flatpak-spawn --host bash
-  ```
-  from inside VSCodium's integrated terminal instructs the host Flatpak portal daemon to spawn an unconfined shell directly within the host user's process space.
+  Because the Software Center hides these entries and no terminal emulator is available to run CLI commands, consumer users cannot discover or launch them. However, once an unprivileged interactive shell is acquired via Vector A, any of these IDEs can be executed directly (e.g., `flatpak run com.vscodium.codium &`).
+
+  > [!WARNING]
+  > **Flatpak Sandbox Escape Mitigation**: In early revisions, developers could execute `flatpak-spawn --host bash` from within VSCodium or PuTTY to break out into an unconfined host shell. In recent platform updates, Reliance Jio hardened the sandbox policy by disabling the session bus endpoint `org.freedesktop.Flatpak` (`Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown`). As a result, Flatpaks run strictly confined and cannot spawn host processes, making **Vector A (`ttyd` + Chrome loopback)** the primary and only reliable ingress vector for host shell access.
 
 ### 2. The 15-Minute Session Termination Guillotine
 The primary operational obstacle on JioPC is sudden session termination: users are logged out after brief periods of inactivity, destroying all active terminal jobs, background models, and running servers.
@@ -254,7 +249,7 @@ All benchmark tests were executed on the target instance under verified isolated
 | **Memory** | • 16 GB capacity supports 7B–9B quantized LLMs.<br/>• Transparent Huge Pages (`THP`) enabled for low TLB overhead. | • **0 MB Swap**: Instant process termination upon memory exhaustion.<br/>• Multi-threaded apps risk heap fragmentation (64 default arenas). |
 | **Storage** | • **581 MB/s continuous sustained write speed** over NFS.<br/>• Fast 4K random latency (0.01 ms on local SSD).<br/>• Generous 1 TB user plan quota.<br/>• 128 GB secondary SSD (`/mnt/sfdisk`) with 100+ pre-installed apps. | • `df -h` reporting quirk shows shared 100 TB multi-tenant pool.<br/>• Plaintext data on enterprise NFS risks compliance/audit scanning.<br/>• Writing thousands of tiny files over NFS suffers from RPC latency. |
 | **Networking** | • High-bandwidth internal datacenter pipe.<br/>• Supports userspace WireGuard mesh via Tailscale.<br/>• Headless SSH bypasses WebRTC video streaming. | • **Direct outbound HTTP/HTTPS blocked** (must use `127.0.0.1:3128`).<br/>• **`CAP_NET_ADMIN` stripped**; `ioctl(TUNSETIFF)` fails on `/dev/net/tun` (kernel VPNs cannot initialize).<br/>• **MagicDNS deadlock**: VPN DNS overrides break proxy PAC resolution.<br/>• Inbound ports strictly blocked by cloud security groups. |
-| **Session & OS** | • Full systemd user session manager available.<br/>• Lingering can be enabled to persist background services.<br/>• Trivially accessible host shell via loopback Web TTY (`ttyd` + Chrome) or Flatpak escape. | • Default **15-minute network-idle session killswitch**.<br/>• WebRTC browser client **intercepts keystrokes** (`Ctrl+W`, `Ctrl+T`).<br/>• Zero administrative (`sudo`) access; cannot install `.deb` packages.<br/>• Server image lacks base desktop terminfo (`TERM=xterm-256color` required). |
+| **Session & OS** | • Full systemd user session manager available.<br/>• Lingering can be enabled to persist background services.<br/>• Trivially accessible host shell via loopback Web TTY (`ttyd` + Chrome via File Manager action).<br/>• Full 24/7 desktop persistence via `jiopc-session-keeper`. | • Default **15-minute network-idle session killswitch**.<br/>• Flatpak host breakout (`flatpak-spawn --host`) blocked by sandbox policy.<br/>• WebRTC browser client **intercepts keystrokes** (`Ctrl+W`, `Ctrl+T`).<br/>• Zero administrative (`sudo`) access; cannot install `.deb` packages.<br/>• Server image lacks base desktop terminfo (`TERM=xterm-256color` required). |
 
 ---
 
@@ -265,10 +260,10 @@ To convert this restricted VDI desktop into an enterprise-grade 24/7 headless wo
 ```mermaid
 graph LR
     subgraph Core Workarounds
-        Z[Initial Bootstrap] -->|ttyd + Chrome / Flatpak| A0[Interactive Host Shell]
-        A0 --> A[Session Persistence]
+        Z[Initial Bootstrap] -->|ttyd + Chrome via File Manager| A0[Interactive Host Shell]
+        A0 --> A[Session Keeper Daemon]
         A -->|loginctl enable-linger| B[Survive VDI Logout]
-        A -->|Audio Heartbeat Socket| C[Bypass 15-min XRDP Kill]
+        A -->|Loopback Latch + gRPC Heartbeats| C[Bypass 15-min Teardown & Cloud Reclaim]
         
         A0 --> D[Remote Connectivity]
         D -->|Userspace Tailscale| E[Bypass TUN & Firewall]
@@ -282,105 +277,96 @@ graph LR
 
 ### 0. Initial Bootstrap: Acquiring an Interactive Shell
 
-Because stock JioPC instances omit standard terminal emulators, establishing an interactive shell requires bypassing the graphical restriction. Two proven vectors achieve this:
+Stock JioPC instances omit standard Linux terminal emulators (`gnome-terminal`, `xterm`, `alacritty`), have no terminal icons in desktop menus, and client-side operating systems frequently intercept standard keyboard shortcuts (`Ctrl + Alt + T`, `Alt + F2`). Furthermore, sandboxed Flatpaks can no longer spawn unconfined host processes via `flatpak-spawn --host` due to portal restrictions.
 
-#### Method 1: Blind Execution & Loopback Web TTY (`ttyd` + Chrome) [Primary / Zero-Dependency]
+To bootstrap an unrestricted host shell with **100% GUI mouse clicks (zero hotkeys, zero root privileges)**, use **`ttyd`** to tunnel an interactive bash pseudo-terminal directly into **Google Chrome** over local WebSockets:
 
-This method operates with zero external dependencies and does not rely on Flatpak or application portal availability.
+#### Phase 1: Download `ttyd` via Google Chrome
+1. Open **Google Chrome** inside your JioPC desktop session.
+2. Paste the official standalone binary release URL into the address bar and press **Enter**:
+   ```text
+   https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64
+   ```
+3. Chrome will download `ttyd.x86_64` directly into `~/Downloads`. *(If prompted with "This file may harm your computer", click **Keep**)*.
 
-* **Phase 1: Initial Access (Blind Execution)**  
-  Initial footprinting is achieved by leveraging a user-writable execution script (e.g., `run.sh` or a custom `.desktop` launcher placed on `~/Desktop`). By piping diagnostic command output directly to a text file:
-  ```bash
-  uname -a > ~/Desktop/output.txt
-  ps aux >> ~/Desktop/output.txt
-  id >> ~/Desktop/output.txt
-  ```
-  the internal process tree, network topology, and VDI architecture can be fully mapped without requiring an open terminal window.
+#### Phase 2: Create the "Web Terminal" Custom Action in File Manager
+Stock JioPC uses Thunar as its file manager, which provides arbitrary shell execution via Custom Actions:
+1. Open **File Manager** (double-click "Downloads" or "Computer" on your desktop).
+2. In the top menu bar, click: **`Edit` → `Configure custom actions...`**.
+3. Click the **`+`** (Add) button on the right side.
+4. In the **Basic** tab:
+   - **Name**: `Open Web Terminal`
+   - **Description**: `Launch interactive bash terminal in Google Chrome`
+   - **Command**: Copy and paste this self-healing one-liner:
+     ```bash
+     bash -c "ls ~/Downloads/ttyd* >/dev/null 2>&1 || curl -sL https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64 -o ~/Downloads/ttyd.x86_64; chmod +x ~/Downloads/ttyd*; pgrep -f ttyd >/dev/null || nohup ~/Downloads/ttyd* -W -p 7681 bash >/dev/null 2>&1 & sleep 1; google-chrome http://localhost:7681"
+     ```
+5. In the **Appearance Conditions** tab:
+   - Check **Directories** (or leave all checked).
+6. Click **OK**, then click **Close**.
 
-* **Phase 2: GUI Evasion & Blind Shell Pivot**  
-  Following the discovery that standard terminal packages are restricted, a blind shell is established by repurposing pre-installed scripting runtimes (such as Python 3 or `zenity`). This provides basic execution capability to stage network payloads and scripts.
+#### Phase 3: Launch the Terminal!
+1. **Right-click** anywhere in the empty space inside File Manager.
+2. Select **`Open Web Terminal`**.
+3. 👉 **Google Chrome will instantly open a tab at `http://localhost:7681` with an active, interactive Linux bash shell!**
 
-* **Phase 3: Payload Delivery (`ttyd`)**  
-  Using the blind execution method, a statically compiled binary of the open-source web terminal utility [`ttyd`](https://github.com/tsl0922/ttyd) (v1.7.7) is fetched directly into `/tmp` via `wget` and marked executable:
-  ```bash
-  wget -qO /tmp/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64
-  chmod +x /tmp/ttyd
-  ```
-
-* **Phase 4: Interactive Pivot (Browser-Based Web TTY)**  
-  To establish a fully interactive TTY, the `ttyd` daemon is executed with write permissions enabled (`-W`) and bound to a local loopback port:
-  ```bash
-  /tmp/ttyd -W -p 9999 bash &
-  ```
-  Because the pre-installed Google Chrome browser (`/opt/google/chrome/chrome`) is an allowed application, navigating to `http://127.0.0.1:9999` opens a responsive pseudo-terminal (PTY) inside a browser tab. This successfully bypasses the VDI's terminal restrictions by tunneling the bash shell over local WebSockets directly into the browser.
-
-* **Post-Bootstrap Tooling & AI Agent Workflows**  
-  Once the interactive read/write shell is established in the browser tab, the environment can be prepared for advanced developer workflows. Modern agentic tooling, such as the Antigravity CLI (`agy`), along with `tmux` and language package managers, can be fetched, installed, and configured directly within the terminal tab. This creates a fully functional, AI-assisted development workflow running entirely inside the desktop instance.
+> [!NOTE]
+> - **Self-Healing Fallback**: The command automatically falls back to downloading `ttyd` via `curl` if the file was not pre-downloaded via Chrome.
+> - **Writable Flag (`-W`)**: Must be specified, as `ttyd` defaults to a read-only terminal without it.
+> - **Port 7681**: Standard default `ttyd` listening port.
+> - **Desktop Shortcut**: Once in the terminal, you can optionally pin a launcher to the desktop:
+>   ```bash
+>   cat << 'EOF' > ~/Desktop/terminal.desktop
+>   [Desktop Entry]
+>   Version=1.0
+>   Name=Web Terminal
+>   Exec=bash -c "ls ~/Downloads/ttyd* >/dev/null 2>&1 || curl -sL https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64 -o ~/Downloads/ttyd.x86_64; chmod +x ~/Downloads/ttyd*; pgrep -f ttyd >/dev/null || nohup ~/Downloads/ttyd* -W -p 7681 bash >/dev/null 2>&1 & sleep 1; google-chrome http://localhost:7681"
+>   Icon=utilities-terminal
+>   Type=Application
+>   EOF
+>   chmod +x ~/Desktop/terminal.desktop
+>   ```
 
 ---
 
-#### Method 2: Launching Pre-Installed Flatpak IDEs & Session Breakout [Alternative]
+### 1. Guarantee 24/7 Session Persistence (`jiopc-session-keeper`)
 
-While the Jio Software Center UI has removed user-facing listings for developer IDEs, popular IDE packages are **already pre-installed system-wide** on the secondary SSD (`/mnt/sfdisk`). Once an interactive shell is obtained via Method 1:
-1. Launch the pre-installed VSCodium or Code-OSS:
-   ```bash
-   flatpak run com.vscodium.codium &
-   ```
-2. Open its integrated terminal (`Ctrl + ~`).
-3. If operating within the Flatpak sandbox, break out into the host OS shell:
-   ```bash
-   flatpak-spawn --host bash
-   ```
-4. You now have direct interactive shell access to the host.
+Early workarounds used simple loop scripts (`keep-awake.sh`) poking audio sockets (`sound_playing`). While that suppressed the connected idle timer, closing your browser or experiencing a network drop still triggered `XRDP_SESMAN_KILL_DISCONNECTED=1`, destroying the X11 graphical display server and causing the cloud broker to deprovision the node after 15 minutes.
 
-### 1. Guarantee 24/7 Session Persistence
-Execute the following to ensure background processes and daemons survive when closing the web browser:
+To achieve **complete, uninterrupted 24/7 persistence for both background processes and the entire graphical desktop environment**, use the open-source **JioPC Session Keeper** daemon:
+
+👉 **GitHub Repository**: [https://github.com/sys-dissect/jiopc-session-keeper](https://github.com/sys-dissect/jiopc-session-keeper)
+
+#### What the Session Keeper Accomplishes:
+1. **Display Server Socket Latching**: The instant your client disconnects, the daemon attaches a local loopback handler to the XRDP display socket, disengaging the 15-minute local teardown sequence.
+2. **Cloud Orchestrator Heartbeats**: It emits periodic session continuity heartbeats over gRPC to the local Accops agent (`/run/accops/dvm/grpc.sock`), preventing the cloud orchestrator from reclaiming the compute node.
+3. **Seamless Handover on Reconnect**: When you log back in from your browser or RDP client, the daemon immediately yields the socket, providing a smooth transition back to your active desktop.
+4. **Window Manager Sanitization**: Automatically refreshes window manager grabs (`xfwm4`) upon reconnect, preventing mouse clicks and pointer events from getting trapped.
+5. **Zero Root Required**: Runs entirely in user space under `systemd --user`.
+
+#### One-Line Installation:
+From your newly opened terminal in Chrome, run:
 
 ```bash
-# Step 1: Enable systemd user lingering (persists user systemd daemon across logouts)
-loginctl enable-linger $USER
-
-# Step 2: Deploy the Audio-Socket Heartbeat Daemon
-mkdir -p ~/bin ~/.config/systemd/user
-cat << 'EOF' > ~/bin/keep-awake.sh
-#!/usr/bin/env bash
-USER_ID="$(id -u)"
-# Auto-heal systemd linger across ephemeral compute node reassignments
-loginctl enable-linger "$USER" 2>/dev/null || true
-
-while true; do
-    # Reset Accops XRDP idle timeout via UNIX domain stream socket
-    for sock in /var/run/xrdp/"$USER_ID"/xrdp_idle_timeout_data_flow_*; do
-        if [ -S "$sock" ]; then
-            printf "sound_playing" | nc -U -w 1 "$sock" 2>/dev/null || true
-        fi
-    done
-    DISPLAY="${DISPLAY:-:10.0}" xset s off s 0 0 -dpms 2>/dev/null || true
-    sleep 30
-done
-EOF
-chmod +x ~/bin/keep-awake.sh
-
-# Step 3: Enable keep-awake systemd user service
-cat << 'EOF' > ~/.config/systemd/user/keep-awake.service
-[Unit]
-Description=XRDP Idle Timeout Bypass Daemon
-After=default.target
-
-[Service]
-Type=simple
-ExecStart=%h/bin/keep-awake.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-systemctl --user daemon-reload && systemctl --user enable --now keep-awake.service
+git clone https://github.com/sys-dissect/jiopc-session-keeper.git
+cd jiopc-session-keeper && ./install.sh
 ```
 
-> [!NOTE]
-> Poking the audio stream socket suppresses XRDP's 15-minute connected idle killswitch (`XRDP_SESMAN_MAX_IDLE_TIME=900`). If you disconnect or close your browser tab, `XRDP_SESMAN_KILL_DISCONNECTED=1` will still terminate the X11 GUI session; however, because `enable-linger` is active, `systemd-logind` will **not** kill your user processes. All background services (Tailscale, SSH, long-running compilations, AI models) remain permanently active.
+The installer will:
+1. Initialize a lightweight user-space Python virtual environment with `grpcio`.
+2. Enable `systemd` user lingering (`loginctl enable-linger`) so background daemons survive disconnections.
+3. Install and activate `xrdp-session-keeper.service` under `systemd --user`.
+
+#### Verify & Test:
+```bash
+# Verify daemon service status
+systemctl --user status xrdp-session-keeper.service
+
+# View live daemon activity logs
+tail -f ~/.local/state/session-keeper.log
+```
+
+To test: leave windows, compilers, or editors open, close your browser tab/RDP client, wait 20–30 minutes, and reconnect. Your full desktop environment and background jobs will be running exactly as you left them.
 
 ### 2. Configure Headless Zero-Lag Remote Access (Tailscale + SSH)
 Bypass the web browser completely and connect directly via native terminal or VS Code Remote-SSH:
