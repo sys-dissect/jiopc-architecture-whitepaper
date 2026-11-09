@@ -100,12 +100,22 @@ storage-cons-prod-dp.jiopc.local:/fs_cons_prod_119/001217236281/001217236281_0  
 * **Mechanism**: In NFSv4.1, `df` issues a `STATFS` RPC request to the remote storage controller (`10.0.12.9`). The storage appliance reports metrics for the parent volume export (`/fs_cons_prod_119`), which is a 100 TB aggregate storage pool hosting workspaces for hundreds of tenants.
 * **User Reality**: The user's actual files consume only **7.3 GB**. The ~395 GB "used" metric represents the collective footprint of all tenants provisioned on cluster volume 119.
 * **Quota Reality**: The user's account plan includes **1 TB**. This quota is enforced server-side. Exceeding 1 TB triggers `EDQUOT` (Disk quota exceeded), despite `df` reporting 99 TB available.
+* **Kerberos RPC Overhead (`sec=krb5p`)**: Home directories are mounted with `sec=krb5p` (Kerberos payload privacy/encryption). While sequential streaming achieves high throughput, metadata-heavy operations (`node_modules`, `git status`, SQLite WAL locks, compiler caches) incur substantial cryptographic network RPC round-trip penalties.
+
+#### High-Speed Scratch Opportunity: The World-Writable Tier 2 SSD
+While `/mnt/sfdisk` is owned by root, the directory **`/mnt/sfdisk/flatpak` is world-writable (`drwxrwxrwx`)** with **~36 GB of free space** on the local ext4 SSD:
+* **Benchmark Comparison (5,000 Synchronous Writes)**:
+  - Kerberos NFS Home: `0.068s`
+  - Local SSD (`/mnt/sfdisk/flatpak`): `0.015s` (**4.7× faster!**)
+* **Optimization**: Redirecting high-frequency compilation caches (`UV_CACHE_DIR`, `BUN_INSTALL_CACHE_DIR`, `CARGO_TARGET_DIR`, and `TMPDIR`) to `/mnt/sfdisk/flatpak/scratch-$USER/` provides a dramatic performance boost and eliminates NFS locking contention.
 
 ### 5. Network Perimeter & Security Topology
 * **Network Adapter**: Virtual Ethernet adapter (`eth0`) with local IPv4 address `10.1.10.98/24` on an isolated Azure Virtual Network (vNet).
 * **Internal DNS Infrastructure**: System name resolution queries dedicated internal datacenter DNS resolvers at `10.163.66.132` and `10.163.66.134`.
 * **Firewall Restrictions**: Direct outbound TCP traffic to external IPv4 addresses on standard ports (80, 443, 22) is dropped at the cloud security group boundary.
-* **Proxy Architecture**: All outbound internet connectivity is mediated through a local forward proxy broker (`px-proxy` / Squid on `127.0.0.1:3128`), which resolves authentication against an enterprise PAC cluster (`proxy-ngpr.jiopc.local:8080/proxy.pac`).
+* **Dual-Proxy Architecture & Egress Filtering**:
+  - **Local Broker (`127.0.0.1:3128`)**: Outbound traffic through the local proxy is subject to Azure Firewall policy (`jioazure-central-cons-daas-prod-cp-fw-policy`, rule collection `Dataplane-to-Internet-Deny`, rule `VDI-to-ngrok_and_tor-Deny`). This rule inspects TLS Client Hello SNI headers and forcibly drops connections to tunnel/VPN domains (`*.tailscale.com`), returning `SSL_ERROR_SYSCALL` under HTTPS or HTTP 470 under HTTP.
+  - **Internal Core Proxy (`proxy-ngpr.jiopc.local:3128` / `10.0.8.101`)**: Connecting directly through the internal datacenter proxy bypasses the restrictive application rule group, successfully routing Tailscale controlplane, DERP relays, and external package downloads.
 * **Kernel Privilege Restrictions**:
   * Unprivileged user UID (e.g. `3387120`, `3500894`).
   * Sudo access: Strictly denied (`user is not in sudoers file`).
@@ -155,11 +165,18 @@ The primary operational obstacle on JioPC is sudden session termination: users a
 
 #### Forensic Analysis of the XRDP Stack
 1. **Ruling Out OOM and Kernel Crashes**: Examination of `/var/log/syslog`, `dmesg`, and `systemd-journald` verified continuous uptime (>16 hours) with zero kernel panics and zero OOM events (`oomctl` pressure score: 0).
-2. **Decompilation of `libxorgxrdp.so`**: Decompiling the X11 XRDP driver (`/usr/lib/xorg/modules/libxorgxrdp.so`) revealed hardcoded session management environment overrides:
-   * `XRDP_SESMAN_MAX_IDLE_TIME=900` (Strict 900-second / 15-minute idle limit while connected).
-   * `XRDP_SESMAN_KILL_DISCONNECTED=1` (Forces session teardown immediately upon client disconnect).
-   * `XRDP_SESMAN_MAX_DISC_TIME=900` (900-second disconnect timeout fallback).
-   * `XRDP_SESMAN_AUDIO_DISABLE_IDLETIMEOUT=1` (Audio activity pauses the idle counter).
+2. **Decompilation of `libxorgxrdp.so` & Vendor Config Confirmation**: Decompiling the X11 XRDP driver (`/usr/lib/xorg/modules/libxorgxrdp.so`) and inspecting the primary Accops DVM configuration ([`/etc/accops/dvm/.userconfig.json`](file:///etc/accops/dvm/.userconfig.json)) confirmed vendor-level session policy:
+   ```json
+   {
+     "EnableIdleTimeoutbyAudio": true,
+     "EnableIdleTimeoutbyFileTransfer": false,
+     "DisconnectIdleSessionViaClient": true,
+     "EnableUserProfileMountwithKerberos": true
+   }
+   ```
+   * `"EnableIdleTimeoutbyAudio": true`: Primary confirmation that audio activity explicitly pauses the idle timeout in `xrdp-chansrv`.
+   * `"EnableIdleTimeoutbyFileTransfer": false`: File transfer / disk activity is rejected as an activity signal.
+   * `XRDP_SESMAN_KILL_DISCONNECTED=1`: Client disconnect immediately triggers local display termination.
 3. **Synthetic Event Failure**: Traditional keep-alive scripts (`xdotool mousemove_relative`) fail completely because `libxorgxrdp.so` does not read local X11 input event queues to track idle time. It monitors **only raw incoming RDP network packets from the remote client** (`rdpInputMouseEvent`). Local synthetic input is completely invisible to the driver.
 4. **Logind User Slice Destruction**: In default configuration, `loginctl show-user` showed **`Linger=no`**. When XRDP terminates the graphical session, `systemd-logind` treats the user as completely logged out and issues a recursive `SIGKILL` across the user's systemd slice, killing every process spawned by the user.
 5. **Modern PipeWire Audio Architecture**: The audio subsystem runs **PipeWire** (`pipewire`, `pipewire-pulse`) with the module `libpipewire-module-xrdp-pipewire`. PipeWire streams map audio flows into the XRDP idle-timeout control socket (`/var/run/xrdp/$UID/xrdp_idle_timeout_data_flow_${DISPLAY_NUM:-10}`). This socket is an unprivileged UNIX domain **stream socket** (`SOCK_STREAM`). Transmitting keep-alive stream connections directly to this socket safely suppresses XRDP's idle killswitch while the browser is open. When the browser is disconnected, `XRDP_SESMAN_KILL_DISCONNECTED=1` will still terminate the X11 display, but background processes survive via systemd lingering.
@@ -373,8 +390,9 @@ Bypass the web browser completely and connect directly via native terminal or VS
 
 ```bash
 # Step 0: Download and unpack Tailscale binaries in user space
+# (CRITICAL: Route download through internal proxy-ngpr to bypass Azure Firewall SNI drop)
 mkdir -p ~/bin ~/.local/share/tailscale
-curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.74.0_amd64.tgz | tar -xz -C /tmp
+curl -x http://proxy-ngpr.jiopc.local:3128 -fsSL https://pkgs.tailscale.com/stable/tailscale_1.102.3_amd64.tgz | tar -xz -C /tmp
 mv /tmp/tailscale_*/tailscale* ~/bin/
 rm -rf /tmp/tailscale_*
 
@@ -395,6 +413,7 @@ Environment="NO_PROXY=localhost,127.0.0.1,::1,proxy-ngpr.jiopc.local,10.0.8.101"
 Environment="no_proxy=localhost,127.0.0.1,::1,proxy-ngpr.jiopc.local,10.0.8.101"
 ExecStart=%h/bin/tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1056 --socket=%h/tailscaled.sock --statedir=%h/.local/share/tailscale --state=%h/.local/share/tailscale/tailscaled.state
 LimitNOFILE=65536
+OOMPolicy=continue
 Restart=always
 RestartSec=5
 
@@ -404,18 +423,19 @@ EOF
 systemctl --user daemon-reload && systemctl --user enable --now tailscaled.service
 
 # Step 2: Configure CLI alias and authenticate Tailscale
-# (CRITICAL: disable MagicDNS to preserve local forward proxy routing)
+# (CRITICAL: disable MagicDNS to preserve local forward proxy routing; enable route acceptance)
 alias tailscale='tailscale --socket=$HOME/tailscaled.sock'
-tailscale --socket=$HOME/tailscaled.sock up --accept-dns=false --ssh
+tailscale --socket=$HOME/tailscaled.sock up --accept-dns=false --accept-routes=true --ssh
 
 # Step 3: Generate unprivileged host keys and configure SSH server
+# NOTE: OpenSSH does NOT expand %h in HostKey or PidFile! You must provide an absolute path.
 mkdir -p ~/.ssh/host_keys
 ssh-keygen -t ed25519 -f ~/.ssh/host_keys/ssh_host_ed25519_key -N ""
 
-cat << 'EOF' > ~/.ssh/sshd_config_user
+cat << EOF > ~/.ssh/sshd_config_user
 Port 2222
 ListenAddress 127.0.0.1
-HostKey %h/.ssh/host_keys/ssh_host_ed25519_key
+HostKey $HOME/.ssh/host_keys/ssh_host_ed25519_key
 AuthorizedKeysFile %h/.ssh/authorized_keys
 StrictModes no
 PubkeyAuthentication yes
@@ -423,9 +443,10 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM no
 UseDNS no
-PidFile %h/sshd.pid
-ClientAliveInterval 30
-ClientAliveCountMax 3
+PidFile $HOME/sshd.pid
+TCPKeepAlive yes
+ClientAliveInterval 15
+ClientAliveCountMax 4
 EOF
 chmod 600 ~/.ssh/sshd_config_user ~/.ssh/host_keys/*
 
@@ -439,6 +460,7 @@ After=network.target
 Type=simple
 ExecStart=/usr/sbin/sshd -D -f %h/.ssh/sshd_config_user
 LimitNOFILE=65536
+OOMPolicy=continue
 Restart=always
 RestartSec=5
 
@@ -447,8 +469,12 @@ WantedBy=default.target
 EOF
 systemctl --user daemon-reload && systemctl --user enable --now user-sshd.service
 
-# Step 5: Forward Port 2222 over Tailnet
+# Step 5: Forward SSH (Port 2222) and RDP (Port 3389) over Tailnet
 tailscale --socket=$HOME/tailscaled.sock serve --bg --tcp 2222 127.0.0.1:2222
+tailscale --socket=$HOME/tailscaled.sock serve --bg --tcp 3389 127.0.0.1:3389
+
+# Tip: You can now connect with native low-latency RDP clients:
+# xfreerdp /v:<tailscale-ip>:3389 /u:<user> /cert:ignore
 ```
 
 ### 3. Deploy Zero-Knowledge Storage Encryption (`rclone crypt`)
@@ -475,9 +501,23 @@ export KMP_AFFINITY=granularity=fine,compact,1,0
 export MALLOC_ARENA_MAX=4
 export MALLOC_TRIM_THRESHOLD_=131072
 
-# Route temporary and build artifacts to fast local SSD
-export TMPDIR="/tmp"
-export PIP_CACHE_DIR="/tmp/pip-cache"
+# Fast Local SSD scratch redirection (bypasses Kerberos NFS RPC latency)
+if [ -d "/mnt/sfdisk/flatpak" ]; then
+    export SCRATCH_DIR="/mnt/sfdisk/flatpak/scratch-$USER"
+    mkdir -p "$SCRATCH_DIR/tmp" "$SCRATCH_DIR/pip-cache" "$SCRATCH_DIR/uv-cache" "$SCRATCH_DIR/bun-cache" "$SCRATCH_DIR/cargo-target" 2>/dev/null || true
+    export TMPDIR="$SCRATCH_DIR/tmp"
+    export PIP_CACHE_DIR="$SCRATCH_DIR/pip-cache"
+    export UV_CACHE_DIR="$SCRATCH_DIR/uv-cache"
+    export BUN_INSTALL_CACHE_DIR="$SCRATCH_DIR/bun-cache"
+    export CARGO_TARGET_DIR="$SCRATCH_DIR/cargo-target"
+else
+    export TMPDIR="/tmp"
+    export PIP_CACHE_DIR="/tmp/pip-cache"
+fi
+
+# Tailscale SOCKS5 & HTTP egress routing helpers (bypasses corporate filters)
+alias ts-proxy='export ALL_PROXY="socks5h://127.0.0.1:1055" HTTP_PROXY="http://127.0.0.1:1056" HTTPS_PROXY="http://127.0.0.1:1056" && echo "[+] Routed traffic via Tailnet (SOCKS5: 1055, HTTP: 1056)"'
+alias ts-unproxy='unset ALL_PROXY HTTP_PROXY HTTPS_PROXY && echo "[-] Restored default JioPC proxy"'
 ```
 
 Configure SSH client multiplexing in `~/.ssh/config`:
